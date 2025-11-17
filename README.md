@@ -42,6 +42,26 @@ You can run the evaluation on writing quality, semantic diversity, and style div
 
 For human evaluation, you can run `scripts_eval.prepare_human_eval_data` first to get the summarized versions of generated writings. Then, you can use this file to run annotation tasks on [Potato](https://github.com/davidjurgens/potato) (whose configuration code is under `human-eval`).
 
+## Evaluation Results
+
+Evaluation results from our experiments are available in the `results/` directory. Each CSV file contains generated responses along with evaluation metrics:
+
+- **`gen_eval1_baseline.csv`** - Baseline model (Gemma-2-2B-IT) without fine-tuning
+- **`gen_eval1_SFT.csv`** - Supervised fine-tuned model
+- **`gen_eval1_DORPO_sem.csv`** - DORPO model trained with semantic diversity
+- **`gen_eval1_DORPO_sty.csv`** - DORPO model trained with style diversity  
+- **`gen_eval1_DORPO_both.csv`** - DORPO model trained with both semantic and style diversity
+
+Each CSV file contains the following columns:
+- `prompt_id`: Unique identifier for the writing prompt
+- `prompt`: The original writing prompt text
+- `response`: Generated response from the model
+- `reddit_reward`: Reward model score (quality metric)
+- `semantic_diversity`: Semantic diversity score
+- `style_diversity`: Style diversity score
+
+These results were generated on a subset of 200 test prompts, with 4 generations per prompt (800 total generations per model).
+
 Model checkpoints coming soon..!
 
 ## Citing the work
