@@ -1,77 +1,85 @@
-# Model Tuning for Creative Writing
+# SafeORPO for Safe and Creative Story Writing
 
-Try run scripts like `python -m reward_model_scripts.data_prep` instead of doing `python reward_model_scripts/data_prep.py`... except they are within the shell command file or ran with accelerate. We are using module approach to run python codes.
+This repo contains the full SafeORPO pipeline for creative writing: data prep, safety annotation, high-risk selection, reward modeling, SafeORPO training, evaluation, and plotting.
 
-We are using [`euclaise/WritingPrompts_preferences`](https://huggingface.co/datasets/euclaise/WritingPrompts_preferences) as the source dataset. 
+We use the WritingPrompts preferences dataset and module-style execution (e.g., `python -m scripts_dataset_cleaner.0_data_prep_scoring`).
 
-## Data processing
+## Environment
+- Python env: use your preferred venv/conda; install dependencies (see `requirements.txt` if present).
+- Many scripts expect OpenAI-compatible access via CMU gateway: set `OPENAI_API_KEY` and, when needed, `--openai_base_url https://ai-gateway.andrew.cmu.edu`.
+- GPU training uses `accelerate` (see sbatch templates under `scripts/sbatch/`).
 
-1. By running `scripts_dataset_cleaner.0_data_prep_scoring`, we first clean the "prompts" (or posts) by removing phrases between `[]` parenthesis (these include some information irrelevant to writing prompts). Then, we transform the score so that it can be used for reward model training. 
-- The input path is `--source` and the output path is `--data_path`.
-2. By running `scripts_dataset_cleaner.1_data_prep_filtering`, we remove irrelevant "writings" (or comments) (e.g., moderation comments) from the dataset. We also filter out excessively long writings, as they can overload the training pipeline. 
-- The input path is `--source` and the output path is `--data_path`. `--model_to_use` is the model used for deciding whether the writing is long or not. 
-3. By running `scripts_dataset_cleaner.2_data_prep_to_preference`, we turn the dataset into a pairwise "preference dataset."
-- The input path is `--source` and the output path is `--data_path_pair`. `--data_path_filtered` is an optional path you can use if you want to store the unpaired dataset with those instances used in the paired preference dataset. `--gap` decides how many votes gaps you would like to have between winning and losing instances.
-4. By running `scripts_dataset_cleaner.3_data_prep_for_diversified_training`, we turn the dataset into a pairwise preference dataset with "deviation scores" attached. 
-- The input path is `--source_pair` and the output path is `--data_path_pair_div`. `--score_process` indicates which type of diversity/deviation you will use. It should be a list including either "semantic" or "style". `--device` decides which device to use for calculating text embeddings.
-- `--max_cutoff` decides the maximum number of instances per prompt, and when it is `-1`, all instances are used. `--min_score_non_zero` changes the deviation score below threshold (-0.8) to the threshold value. `--sort_with_score` sorts the instances according to quality score so that high quality winning instances can be picked first. These three parameters are used to run the ablation study.
-5. By running `scripts_dataset_cleaner.4_data_prep_divpo`, we turn the dataset into pairs used for [DivPO](https://arxiv.org/abs/2501.18101).
-- The input path is `--source` and the output path is `--data_path_pair`. `--score_process` indicates which type of diversity/deviation you will use. It should be a list including either "semantic" or "style". `--device` decides which device to use for calculating text embeddings.
-- `--max_pair_num` decides the number of instances per prompt. `--rho` decides the percentage of high or low quality instances to be included in the training dataset.
+## Data Pipeline (module-style)
+Source dataset: `euclaise/WritingPrompts_preferences`.
 
-## Reward model training
+Run in order (adjust paths as needed):
+1) Clean + score (for reward model):
+   - `python -m scripts_dataset_cleaner.0_data_prep_scoring --source <raw> --data_path data/clean_scored`
+2) Filter comments (remove mod/noise, length trim):
+   - `python -m scripts_dataset_cleaner.1_data_prep_filtering --source data/clean_scored --data_path data/filtered --model_to_use <hf-embed-model>`
+3) Pairwise preference (quality):
+   - `python -m scripts_dataset_cleaner.2_data_prep_to_preference --source data/filtered --data_path_pair data/pair_pref --gap 1`
+4) Diversity pairs (semantic/style deviation):
+   - `python -m scripts_dataset_cleaner.3_data_prep_for_diversified_training --source_pair data/pair_pref --data_path_pair_div data/pair_pref_div --score_process semantic style --device cuda`
+   - Optional knobs: `--max_cutoff`, `--min_score_non_zero`, `--sort_with_score`
+5) DivPO pairs:
+   - `python -m scripts_dataset_cleaner.4_data_prep_divpo --source data/filtered --data_path_pair data/pair_divpo --score_process semantic style --device cuda`
 
-To train a reward model, you can run `scripts_reward_modeling.reward_model_train` - we recommend running it with accelerate. The shell command is in `cm_reward.sh`.
-For the reward model, now we are tuning `gemma-2b` model with lora. You can evaluate this model with `scripts_reward_modeling.reward_model_perf_analysis`.
+## Safety Annotations and High-Risk IDs
+1) Annotate safety flags (JSONL):
+   - `python scripts_orpo/annotate_safety_flags.py --dataset <hf_or_disk_path> --output_jsonl results/annotations/safety_flags.jsonl --model_name gpt-4o-mini-2024-07-18 --base_url https://ai-gateway.andrew.cmu.edu`
+2) High-risk ID selection:
+   - `python scripts_orpo/generate_high_risk_ids.py --annotations_jsonl results/annotations/safety_flags.jsonl --output_json data/annotations/high_risk_ids.json --num_samples 700 --safety_flags very_high high --max_length_tokens <optional>`
+High-risk IDs trigger full SafeORPO (RaR + diversity); others use DORPO-style weighting.
 
-## Supervised finetuning
+## Reward Model
+- Train (LoRA Gemma-2B example):
+  - `accelerate launch scripts_reward_modeling/reward_model_train.py --model_name google/gemma-2-2b-it --output_dir checkpoints/reward_models/gemma2_2b --use_lora`
+- Evaluate reward model:
+  - `python -m scripts_reward_modeling.reward_model_perf_analysis --model_path checkpoints/reward_models/gemma2_2b --data_path data/filtered`
 
-You can do supervised finetuning with `scripts_finetuning.generation_model_train`. You can find the shell command in `cm_generation.sh`.
+## Generation Training (SafeORPO focus)
+- Main trainer: `scripts_orpo/generation_safeorpo_model_train.py`
+- Key args:
+  - `--modelname google/gemma-2-2b-it` (or other)
+  - `--dataset data/pair_pref_div` (diversity pairs)
+  - `--high_risk_id_path data/annotations/high_risk_ids.json`
+  - `--diversity_model_names jinaai/jina-embeddings-v3`
+  - Response gen params: `--response_max_new_tokens 256 --response_temperature 0.7 --response_top_p 0.95`
+  - Safety/RaR: `--use_rar_implicit --rubric_generation_model gpt-4o-mini-2024-07-18 --openai_base_url https://ai-gateway.andrew.cmu.edu`
+  - Resume: `--auto_resume`
+- Sbatch helpers: see `scripts/sbatch/safeorpo/*.sbatch` (Gemma, Qwen variants).
+- Other baselines:
+  - SFT: `scripts_finetuning/generation_model_train.py`
+  - DORPO: `scripts_orpo/generation_dorpo_model_train.py`
 
-## DPO and DDPO training
+## Evaluation
+- Main eval (reward + semantic/style diversity):
+  - `python scripts_eval/generation_eval1_1.py --modelname <ckpt_or_hf> --output_csv results/gen_eval1_<tag>.csv`
+  - Applies creative developer prompts; handles Gemma/Qwen chat templating.
+- Aux metrics:
+  - `python scripts_eval/generation_eval1_2.py --input_csv results/gen_eval1_<tag>.csv`
+- Gold eval:
+  - `python scripts_eval/generation_eval2.py --input_csv results/gen_eval1_<tag>.csv`
 
-You can do DPO and DDPO training with `scripts_dpo.generation_dpo_model_train` and `scripts_dpo.generation_ddpo_model_train`. Note that DivPO training the DPO training code. Shell commands are `cm_dpo.sh` and `cm_ddpo.sh`, respectively.
+## Plotting
+- Reward vs. diversity (normalized):
+  - `python scripts_eval/plot_safeorpo_results.py` → `plots/reward_vs_diversity.png`
+- Semantic vs. stylistic diversity:
+  - `python scripts_eval/plot_diversity_comparison.py` → `plots/semantic_vs_stylistic_diversity.png`
+- Both plots can consume `plots/summary_statistics.csv` (averaged metrics).
 
-## ORPO and DORPO training
+## Key Directories
+- `data/`: cleaned/filtered/pair datasets; `data/annotations/high_risk_ids.json`
+- `results/`: eval CSVs; `results/annotations/safety_flags.jsonl`
+- `checkpoints/`: reward models under `checkpoints/reward_models/`; generation ckpts under model-specific dirs
+- `plots/`: generated figures and `summary_statistics.csv`
+- `logs/`: training/eval logs
 
-Similarly, you can do ORPO and DORPO training with `scripts_orpo.generation_orpo_model_train` and `scripts_orpo.generation_dorpo_model_train`. Shell commands are `cm_orpo.sh` and `cm_dorpo.sh`.
-
-## Evaluating trained models
-
-You can run the evaluation on writing quality, semantic diversity, and style diversity with `scripts_eval.generation_eval1_1`. Once you have collected evaluation results from `scripts_eval.generation_eval1_1`, you can run `scripts_eval.generation_eval1_2` to get results on auxilliary metrics. You can also run `scripts_eval.generation_eval2` to get results on the gold data (run `scripts_eval.generation_eval1_2` afterward to get auxiliary metrics results, too).
-
-For human evaluation, you can run `scripts_eval.prepare_human_eval_data` first to get the summarized versions of generated writings. Then, you can use this file to run annotation tasks on [Potato](https://github.com/davidjurgens/potato) (whose configuration code is under `human-eval`).
-
-## Evaluation Results
-
-Evaluation results from our experiments are available in the `results/` directory. Each CSV file contains generated responses along with evaluation metrics:
-
-- **`gen_eval1_baseline.csv`** - Baseline model (Gemma-2-2B-IT) without fine-tuning
-- **`gen_eval1_SFT.csv`** - Supervised fine-tuned model
-- **`gen_eval1_DORPO_sem.csv`** - DORPO model trained with semantic diversity
-- **`gen_eval1_DORPO_sty.csv`** - DORPO model trained with style diversity  
-- **`gen_eval1_DORPO_both.csv`** - DORPO model trained with both semantic and style diversity
-
-Each CSV file contains the following columns:
-- `prompt_id`: Unique identifier for the writing prompt
-- `prompt`: The original writing prompt text
-- `response`: Generated response from the model
-- `reddit_reward`: Reward model score (quality metric)
-- `semantic_diversity`: Semantic diversity score
-- `style_diversity`: Style diversity score
-
-These results were generated on a subset of 200 test prompts, with 4 generations per prompt (800 total generations per model).
-
-Model checkpoints coming soon..!
-
-## Citing the work
-
-    @misc{chung2025modifyinglargelanguagemodel,
-      title={Modifying Large Language Model Post-Training for Diverse Creative Writing}, 
-      author={John Joon Young Chung and Vishakh Padmakumar and Melissa Roemmele and Yuqian Sun and Max Kreminski},
-      year={2025},
-      eprint={2503.17126},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2503.17126}, 
-}
+## Quick Start (minimal path)
+1) Data prep steps 1–4 to `data/pair_pref_div`.
+2) Safety annotate → `results/annotations/safety_flags.jsonl`; generate high-risk → `data/annotations/high_risk_ids.json`.
+3) Train reward model (optional if using provided) → `checkpoints/reward_models/...`.
+4) Train SafeORPO: `generation_safeorpo_model_train.py` with high-risk IDs and diversity models.
+5) Eval: `generation_eval1_1.py` (+ `generation_eval1_2.py`, `generation_eval2.py`).
+6) Plot: `plot_safeorpo_results.py`, `plot_diversity_comparison.py`.
